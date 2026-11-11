@@ -1,7 +1,9 @@
+
 from typing import TypedDict
 
+
 class ReviewState(TypedDict):
-    # Pull request info
+    # Pull request information
     pr_url: str
     branch_name: str
     repository: str
@@ -18,6 +20,7 @@ class ReviewState(TypedDict):
     # Human review
     is_approved: bool
     reviewer_feedback: str
+    review_attempts: int
 
     # Workflow tracking
     history: list[str]

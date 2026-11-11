@@ -4,11 +4,17 @@ from typing import Literal
 from app.graph.state import ReviewState
 
 
-def after_refactor(
+def after_review(
     state: ReviewState
-) -> Literal["end"]:
+) -> Literal["propose_refactor", "commit_changes", "end"]:
 
-    if not state.get("refactored_code"):
-        raise ValueError("Refactoring produced no output")
+    # Approved: proceed to GitHub commit
+    if state.get("is_approved"):
+        return "commit_changes"
 
-    return "end"
+    # Maximum of 3 human review attempts
+    if state.get("review_attempts", 0) >= 3:
+        return "end"
+
+    # Rejected: send feedback back to the AI
+    return "propose_refactor"

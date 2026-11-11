@@ -1,6 +1,6 @@
-
 import re
 from urllib.parse import urlparse
+from pathlib import Path
 
 from github import Github
 from langchain_openai import ChatOpenAI
@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from app.config import OPENAI_API_KEY, OPENAI_MODEL, GITHUB_TOKEN
 from app.graph.state import ReviewState
 from app.tools.sandbox_tool import check_python_code
-
+from langgraph.types import interrupt
 
 # -----------------------------------------
 # Structured output from the AI model
@@ -55,6 +55,10 @@ def fetch_pr_node(state: ReviewState) -> dict:
     try:
         repository = github.get_repo(f"{owner}/{repo_name}")
         pull_request = repository.get_pull(int(pr_number))
+        head_repo = pull_request.head.repo
+
+        if head_repo is None:
+            raise ValueError("Pull Request source repository is unavailable")
 
         code_contents = {}
 
@@ -72,7 +76,7 @@ def fetch_pr_node(state: ReviewState) -> dict:
             if len(code_contents) >= 10:
                 break
 
-            content = repository.get_contents(
+            content = head_repo.get_contents(
                 file.filename,
                 ref=pull_request.head.sha
             )
@@ -91,7 +95,7 @@ def fetch_pr_node(state: ReviewState) -> dict:
             raise ValueError("No eligible Python files found in this PR")
 
         return {
-            "repository": repository.full_name,
+            "repository": head_repo.full_name,
             "branch_name": pull_request.head.ref,
             "code_contents": code_contents,
             "history": [
@@ -143,6 +147,7 @@ def propose_refactor_node(state: ReviewState) -> dict:
 
     code_contents = state.get("code_contents", {})
     lint_errors = state.get("lint_errors", {})
+    feedback = state.get("reviewer_feedback", "")
 
     if not code_contents:
         raise ValueError("No source code available for refactoring")
@@ -150,9 +155,7 @@ def propose_refactor_node(state: ReviewState) -> dict:
     total_chars = sum(len(code) for code in code_contents.values())
 
     if total_chars > 60_000:
-        raise ValueError(
-            "PR source exceeds the current AI review limit of 60,000 characters"
-        )
+        raise ValueError("PR source exceeds the 60,000 character limit")
 
     llm = ChatOpenAI(
         model=OPENAI_MODEL,
@@ -165,44 +168,166 @@ def propose_refactor_node(state: ReviewState) -> dict:
     prompt = f"""
 You are a senior Python software engineer.
 
-Your task is to refactor the supplied Python source code.
+Refactor the supplied Python files.
 
 Requirements:
-
-1. Preserve the original program's functionality.
+1. Preserve original functionality.
 2. Improve readability and maintainability.
-3. Follow PEP 8 conventions.
+3. Follow PEP 8.
 4. Fix relevant Black and Flake8 issues.
 5. Avoid unnecessary changes.
-6. Do not introduce new dependencies.
-7. Return the complete source code for every supplied file.
-8. Never invent missing functionality.
+6. Do not introduce dependencies.
+7. Return complete source code for every file.
 
-Original Python files:
+Previous reviewer feedback:
+{feedback}
 
+Original source files:
 {code_contents}
 
 Linting results:
-
 {lint_errors}
 
-Return the improved code and a concise explanation.
+Return improved code and a concise explanation.
 """
 
     response = structured_llm.invoke(prompt)
 
     refactored_code = response.refactored_code
 
-    # Ensure the model returned every original file
     if set(refactored_code) != set(code_contents):
-        raise ValueError(
-            "AI response did not contain exactly the original file set"
-        )
+        raise ValueError("AI response did not contain exactly the original files")
 
     return {
         "refactored_code": refactored_code,
         "history": [
             *state.get("history", []),
-            "AI-generated refactoring completed: " + response.summary
+            "AI refactoring completed: " + response.summary
         ]
     }
+
+
+def human_review_node(state: ReviewState) -> dict:
+    """
+    Pause execution and request human approval.
+    """
+
+    decision = interrupt({
+        "message": "Review the proposed code changes.",
+        "proposed_code": state["refactored_code"],
+        "lint_results": state["lint_errors"],
+        "attempt": state.get("review_attempts", 0) + 1
+    })
+
+    if not isinstance(decision, dict):
+        raise ValueError("Invalid human review response")
+
+    approved = decision.get("approved")
+
+    if not isinstance(approved, bool):
+        raise ValueError("Approval must be True or False")
+
+    feedback = str(decision.get("feedback", ""))[:2000]
+
+    return {
+        "is_approved": approved,
+        "reviewer_feedback": feedback,
+        "review_attempts": state.get("review_attempts", 0) + 1,
+        "history": [
+            *state.get("history", []),
+            "Human review: " + (
+                "APPROVED" if approved else "REJECTED"
+            )
+        ]
+    }
+
+
+def commit_approved_changes_node(state: ReviewState) -> dict:
+    """
+    Commit approved refactored files to the PR source branch.
+    """
+
+    from github import Github, InputGitTreeElement
+
+    if not state.get("is_approved"):
+        raise ValueError("Cannot commit without human approval")
+
+    if not GITHUB_TOKEN:
+        raise ValueError("GITHUB_TOKEN is missing")
+
+    repository_name = state["repository"]
+    branch_name = state["branch_name"]
+    refactored_code = state["refactored_code"]
+
+    if not refactored_code:
+        raise ValueError("No refactored code available")
+
+    github = Github(GITHUB_TOKEN)
+
+    try:
+        repo = github.get_repo(repository_name)
+
+        # Get the latest branch commit
+        branch_ref = repo.get_git_ref(f"heads/{branch_name}")
+        parent_commit = repo.get_git_commit(
+            branch_ref.object.sha
+        )
+
+        tree_elements = []
+
+        for filename, source_code in refactored_code.items():
+
+            path = Path(filename)
+
+            if (
+                path.is_absolute()
+                or "\\" in filename
+                or ".." in path.parts
+                or not filename.endswith(".py")
+            ):
+                raise ValueError(f"Unsafe file path: {filename}")
+
+            # Create GitHub blob
+            blob = repo.create_git_blob(
+                source_code,
+                "utf-8"
+            )
+
+            tree_elements.append(
+                InputGitTreeElement(
+                    path=filename,
+                    mode="100644",
+                    type="blob",
+                    sha=blob.sha
+                )
+            )
+
+        # Create one tree containing all changes
+        new_tree = repo.create_git_tree(
+            tree_elements,
+            base_tree=parent_commit.tree
+        )
+
+        # Create one commit
+        new_commit = repo.create_git_commit(
+            "Apply AI refactoring (human approved)",
+            new_tree,
+            [parent_commit]
+        )
+
+        # Update branch without force pushing
+        branch_ref.edit(
+            new_commit.sha,
+            force=False
+        )
+
+        return {
+            "history": [
+                *state.get("history", []),
+                f"Approved changes committed: {new_commit.sha}"
+            ]
+        }
+
+    finally:
+        github.close()
+

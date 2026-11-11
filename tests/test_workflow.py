@@ -1,3 +1,4 @@
+
 import sys
 from pathlib import Path
 
@@ -7,22 +8,23 @@ sys.path.insert(
 )
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
 
+from app.graph.state import ReviewState
+from app.graph.nodes import human_review_node
 from app.graph.workflow import build_workflow
-from app.graph.edges import after_refactor
+from app.graph.edges import after_review
 
 
 def test_workflow_compiles():
-
     workflow = build_workflow(
         checkpointer_override=InMemorySaver()
     )
-
     assert workflow is not None
 
 
 def test_workflow_contains_all_nodes():
-
     workflow = build_workflow(
         checkpointer_override=InMemorySaver()
     )
@@ -32,11 +34,50 @@ def test_workflow_contains_all_nodes():
     assert "fetch_pr" in nodes
     assert "lint_code" in nodes
     assert "propose_refactor" in nodes
+    assert "human_review" in nodes
+    assert "commit_changes" in nodes
 
 
-def test_after_refactor_routes_to_end():
-
+def test_approved_routes_to_commit():
     state = {
+        "is_approved": True,
+        "review_attempts": 1
+    }
+
+    assert after_review(state) == "commit_changes"
+
+
+def test_rejected_routes_back_to_ai():
+    state = {
+        "is_approved": False,
+        "review_attempts": 1
+    }
+
+    assert after_review(state) == "propose_refactor"
+
+
+def test_maximum_attempts_reached():
+    state = {
+        "is_approved": False,
+        "review_attempts": 3
+    }
+
+    assert after_review(state) == "end"
+
+
+def test_human_review_pause_and_resume():
+
+    builder = StateGraph(ReviewState)
+
+    builder.add_node("human_review", human_review_node)
+    builder.add_edge(START, "human_review")
+    builder.add_edge("human_review", END)
+
+    workflow = builder.compile(
+        checkpointer=InMemorySaver()
+    )
+
+    initial_state = {
         "pr_url": "",
         "branch_name": "",
         "repository": "",
@@ -47,28 +88,32 @@ def test_after_refactor_routes_to_end():
         },
         "is_approved": False,
         "reviewer_feedback": "",
+        "review_attempts": 0,
         "history": []
     }
 
-    assert after_refactor(state) == "end"
-
-
-def test_after_refactor_rejects_empty_output():
-
-    state = {
-        "pr_url": "",
-        "branch_name": "",
-        "repository": "",
-        "code_contents": {},
-        "lint_errors": {},
-        "refactored_code": {},
-        "is_approved": False,
-        "reviewer_feedback": "",
-        "history": []
+    config = {
+        "configurable": {
+            "thread_id": "hitl-test-001"
+        }
     }
 
-    try:
-        after_refactor(state)
-        assert False, "Expected ValueError"
-    except ValueError:
-        pass
+    # First call pauses at interrupt()
+    paused = workflow.invoke(initial_state, config)
+
+    assert "__interrupt__" in paused
+
+    # Resume with human approval
+    resumed = workflow.invoke(
+        Command(
+            resume={
+                "approved": True,
+                "feedback": "Looks good"
+            }
+        ),
+        config
+    )
+
+    assert resumed["is_approved"] is True
+    assert resumed["reviewer_feedback"] == "Looks good"
+    assert resumed["review_attempts"] == 1
