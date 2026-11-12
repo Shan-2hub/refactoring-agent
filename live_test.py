@@ -1,6 +1,6 @@
 def calculate_total(price, quantity):
-    total = price * quantity
-    return total
+    """Calculate the total cost given price and quantity."""
+    return price * quantity
 
 
 # Updated for live PR integration testing
