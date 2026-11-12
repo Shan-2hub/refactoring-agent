@@ -161,8 +161,11 @@ def propose_refactor_node(state: ReviewState) -> dict:
         temperature=0,
         api_key=OPENAI_API_KEY
     )
-
-    structured_llm = llm.with_structured_output(RefactorOutput)
+    structured_llm = llm.with_structured_output(
+        RefactorOutput,
+        method="function_calling",
+        strict=False
+    )
 
     prompt = f"""
 You are a senior Python software engineer.
