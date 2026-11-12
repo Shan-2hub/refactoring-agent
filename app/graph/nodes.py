@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from app.config import OPENAI_API_KEY, OPENAI_MODEL, GITHUB_TOKEN
 from app.graph.state import ReviewState
 from app.tools.sandbox_tool import check_python_code
-from langgraph.types import interrupt
 
 # -----------------------------------------
 # Structured output from the AI model
@@ -207,42 +206,7 @@ Return improved code and a concise explanation.
     }
 
 
-def human_review_node(state: ReviewState) -> dict:
-    """
-    Pause execution and request human approval.
-    """
-
-    decision = interrupt({
-        "message": "Review the proposed code changes.",
-        "proposed_code": state["refactored_code"],
-        "lint_results": state["lint_errors"],
-        "attempt": state.get("review_attempts", 0) + 1
-    })
-
-    if not isinstance(decision, dict):
-        raise ValueError("Invalid human review response")
-
-    approved = decision.get("approved")
-
-    if not isinstance(approved, bool):
-        raise ValueError("Approval must be True or False")
-
-    feedback = str(decision.get("feedback", ""))[:2000]
-
-    return {
-        "is_approved": approved,
-        "reviewer_feedback": feedback,
-        "review_attempts": state.get("review_attempts", 0) + 1,
-        "history": [
-            *state.get("history", []),
-            "Human review: " + (
-                "APPROVED" if approved else "REJECTED"
-            )
-        ]
-    }
-
-
-def commit_approved_changes_node(state: ReviewState) -> dict:
+def apply_changes_node(state: ReviewState) -> dict:
     """
     Commit approved refactored files to the PR source branch.
     """

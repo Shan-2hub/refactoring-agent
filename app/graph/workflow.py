@@ -9,10 +9,8 @@ from app.graph.nodes import (
     fetch_pr_node,
     lint_code_node,
     propose_refactor_node,
-    human_review_node,
-    commit_approved_changes_node
+    apply_changes_node
 )
-from app.graph.edges import after_review
 
 
 connection = sqlite3.connect(
@@ -28,33 +26,16 @@ def build_workflow(checkpointer_override=None):
 
     builder = StateGraph(ReviewState)
 
-    # Register nodes
-    builder.add_node("fetch_pr", fetch_pr_node)
-    builder.add_node("lint_code", lint_code_node)
-    builder.add_node("propose_refactor", propose_refactor_node)
-    builder.add_node("human_review", human_review_node)
-    builder.add_node("commit_changes", commit_approved_changes_node)
+    builder.add_node("fetch_pr_node", fetch_pr_node)
+    builder.add_node("lint_code_node", lint_code_node)
+    builder.add_node("propose_refactor_node", propose_refactor_node)
+    builder.add_node("apply_changes_node", apply_changes_node)
 
-    # Initial execution
-    builder.add_edge(START, "fetch_pr")
-
-    builder.add_edge("fetch_pr", "lint_code")
-    builder.add_edge("lint_code", "propose_refactor")
-    builder.add_edge("propose_refactor", "human_review")
-
-    # Human approval routing
-    builder.add_conditional_edges(
-        "human_review",
-        after_review,
-        {
-            "propose_refactor": "propose_refactor",
-            "commit_changes": "commit_changes",
-            "end": END
-        }
-    )
-
-    # Finish after approved commit
-    builder.add_edge("commit_changes", END)
+    builder.add_edge(START, "fetch_pr_node")
+    builder.add_edge("fetch_pr_node", "lint_code_node")
+    builder.add_edge("lint_code_node", "propose_refactor_node")
+    builder.add_edge("propose_refactor_node", "apply_changes_node")
+    builder.add_edge("apply_changes_node", END)
 
     active_checkpointer = (
         checkpointer_override
@@ -63,7 +44,8 @@ def build_workflow(checkpointer_override=None):
     )
 
     return builder.compile(
-        checkpointer=active_checkpointer
+        checkpointer=active_checkpointer,
+        interrupt_before=["apply_changes_node"]
     )
 
 
